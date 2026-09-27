@@ -4,11 +4,25 @@ from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
-
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 MODEL = "meta/llama-3.3-70b-instruct"
+
+# Load all 6 API keys from Render Environment Variables
+API_KEYS = [
+    os.environ.get("NVIDIA_API_KEY_1"),
+    os.environ.get("NVIDIA_API_KEY_2"),
+    os.environ.get("NVIDIA_API_KEY_3"),
+    os.environ.get("NVIDIA_API_KEY_4"),
+    os.environ.get("NVIDIA_API_KEY_5"),
+    os.environ.get("NVIDIA_API_KEY_6"),
+]
+
+# Remove empty keys
+API_KEYS = [key for key in API_KEYS if key]
+
+# Current key position
+current_key = 0
 
 
 @app.route("/")
@@ -18,12 +32,14 @@ def home():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    try:
-        if not NVIDIA_API_KEY:
-            return jsonify({
-                "error": "NVIDIA_API_KEY is not configured on Render."
-            }), 500
+    global current_key
 
+    if not API_KEYS:
+        return jsonify({
+            "error": "No NVIDIA API keys are configured on Render."
+        }), 500
+
+    try:
         data = request.get_json()
 
         if not data:
@@ -47,49 +63,78 @@ def chat():
             "stream": False
         }
 
-        headers = {
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
+        # Try every available API key
+        total_keys = len(API_KEYS)
+        last_error = None
 
-        response = requests.post(
-            NVIDIA_URL,
-            headers=headers,
-            json=payload,
-            timeout=120
-        )
+        for attempt in range(total_keys):
 
-        try:
-            result = response.json()
-        except Exception:
-            return jsonify({
-                "error": "NVIDIA returned an invalid response.",
-                "status": response.status_code
-            }), 502
+            key_index = (current_key + attempt) % total_keys
+            api_key = API_KEYS[key_index]
 
-        if response.status_code != 200:
-            return jsonify({
-                "error": result.get("detail")
-                or result.get("error")
-                or "NVIDIA API request failed.",
-                "status": response.status_code
-            }), response.status_code
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
 
-        answer = (
-            result.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+            try:
+                response = requests.post(
+                    NVIDIA_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=120
+                )
 
+                try:
+                    result = response.json()
+                except Exception:
+                    result = {}
+
+                # Success
+                if response.status_code == 200:
+
+                    # Keep this successful key for the next request
+                    current_key = key_index
+
+                    answer = (
+                        result.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+
+                    if not answer:
+                        return jsonify({
+                            "error": "NVIDIA returned an empty response."
+                        }), 502
+
+                    return jsonify({
+                        "answer": answer
+                    })
+
+                # Key failed / rate limited / unavailable
+                last_error = (
+                    result.get("detail")
+                    or result.get("error")
+                    or f"NVIDIA API returned status {response.status_code}"
+                )
+
+                # Move to next key
+                current_key = (key_index + 1) % total_keys
+
+            except requests.exceptions.Timeout:
+                last_error = "Request timed out."
+                current_key = (key_index + 1) % total_keys
+
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                current_key = (key_index + 1) % total_keys
+
+        # All keys failed
         return jsonify({
-            "answer": answer
-        })
-
-    except requests.exceptions.Timeout:
-        return jsonify({
-            "error": "NVIDIA API request timed out."
-        }), 504
+            "error": "All NVIDIA API keys failed.",
+            "details": last_error
+        }), 502
 
     except Exception as e:
         return jsonify({
@@ -99,4 +144,7 @@ def chat():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
